@@ -4,6 +4,9 @@ from dataset import Reader
 # import utils
 import torch
 from tranE import TransE, transE_loader, distanceL1
+from create_batch import get_pair_batch_train, get_pair_batch_test, toarray, get_pair_batch_train_common, toarray_float
+from model import BiLSTM_Attention
+import torch.nn as nn
 import os
 import logging
 import math
@@ -39,6 +42,17 @@ def main():
     parser.add_argument('--total_ent', default=0, type=int, help='number of entities')
     parser.add_argument('--total_rel', default=0, type=int, help='number of relations')
 
+    # model architecture
+    parser.add_argument('--BiLSTM_input_size', default=100, type=int, help='BiLSTM input size')
+    parser.add_argument('--BiLSTM_hidden_size', default=100, type=int, help='BiLSTM hidden size')
+    parser.add_argument('--BiLSTM_num_layers', default=2, type=int, help='BiLSTM layers')
+    parser.add_argument('--BiLSTM_num_classes', default=1, type=int, help='BiLSTM class')
+    parser.add_argument('--num_neighbor', default=39, type=int, help='number of neighbors')
+    parser.add_argument('--embedding_dim', default=100, type=int, help='embedding dim')
+
+    # regularization
+    parser.add_argument('--alpha', type=float, default=0.2, help='hyperparameter alpha')
+    parser.add_argument('--dropout', type=float, default=0.2, help='dropout for EaGNN')
 
     # optimization
     parser.add_argument('--max_epoch', default=6, help='max epochs')
@@ -93,7 +107,81 @@ def train(args, dataset, device):
         transE = TransE(entity_set, relation_set, triple_list, args.relationVector_path, args.entityVector_path, embedding_dim=50, learning_rate=0.01, margin=4, L1=True )
         transE.emb_initialize()
         transE.train(epochs=1001)
+    else:
+        if model_name == "CAGED":
+            train_idx = list(range(len(all_triples) // 2))
+            num_iterations = math.ceil(dataset.num_triples_with_anomalies / args.batch_size)
+            model_saved_path = model_name + "_" + args.dataset + "_" + str(args.anomaly_ratio) + ".ckpt"
+            model_saved_path = os.path.join(args.save_dir, model_saved_path)
 
+            # model.load_state_dict(torch.load(model_saved_path))
+            # Model BiLSTM_Attention
+            model = BiLSTM_Attention(args, args.BiLSTM_input_size, args.BiLSTM_hidden_size, args.BiLSTM_num_layers,
+                                     args.dropout,
+                                     args.alpha, args.mu, device).to(device)
+            criterion = nn.MarginRankingLoss(args.gama)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+            #
+            for k in range(args.max_epoch):
+                for it in range(num_iterations):
+                    # start_read_time = time.time()
+                    batch_h, batch_r, batch_t, batch_size = get_pair_batch_train_common(args, dataset, it, train_idx,
+                                                                                        args.batch_size,
+                                                                                        args.num_neighbor)
+                    # end_read_time = time.time()
+                    # print("Time used in loading data", it)
+
+                    batch_h = torch.LongTensor(batch_h).to(device)
+                    batch_t = torch.LongTensor(batch_t).to(device)
+                    batch_r = torch.LongTensor(batch_r).to(device)
+
+                    out, out_att = model(batch_h, batch_r, batch_t)
+
+                    # running_time = time.time()
+                    # print("Time used in running model", math.fabs(end_read_time - running_time))
+
+                    out = out.reshape(batch_size, -1, 2 * 3 * args.BiLSTM_hidden_size)
+                    out_att = out_att.reshape(batch_size, -1, 2 * 3 * args.BiLSTM_hidden_size)
+
+                    pos_h = out[:, 0, :]
+                    pos_z0 = out_att[:, 0, :]
+                    pos_z1 = out_att[:, 1, :]
+                    neg_h = out[:, 1, :]
+                    neg_z0 = out_att[:, 2, :]
+                    neg_z1 = out_att[:, 3, :]
+
+                    # loss function
+                    # positive
+                    pos_loss = args.lam * torch.norm(pos_z0 - pos_z1, p=2, dim=1) + \
+                               torch.norm(pos_h[:, 0:2 * args.BiLSTM_hidden_size] +
+                                          pos_h[:, 2 * args.BiLSTM_hidden_size:2 * 2 * args.BiLSTM_hidden_size] -
+                                          pos_h[:, 2 * 2 * args.BiLSTM_hidden_size:2 * 3 * args.BiLSTM_hidden_size],
+                                          p=2,
+                                          dim=1)
+                    # negative
+                    neg_loss = args.lam * torch.norm(neg_z0 - neg_z1, p=2, dim=1) + \
+                               torch.norm(neg_h[:, 0:2 * args.BiLSTM_hidden_size] +
+                                          neg_h[:, 2 * args.BiLSTM_hidden_size:2 * 2 * args.BiLSTM_hidden_size] -
+                                          neg_h[:, 2 * 2 * args.BiLSTM_hidden_size:2 * 3 * args.BiLSTM_hidden_size],
+                                          p=2,
+                                          dim=1)
+
+                    y = -torch.ones(batch_size).to(device)
+                    loss = criterion(pos_loss, neg_loss, y)
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    pos_loss_value = torch.sum(pos_loss) / (batch_size * 2.0)
+                    neg_loss_value = torch.sum(neg_loss) / (batch_size * 2.0)
+                    logging.info('There are %d Triples in this batch.' % batch_size)
+                    logging.info('Epoch: %d-%d, pos_loss: %f, neg_loss: %f, Loss: %f' % (
+                        k, it + 1, pos_loss_value.item(), neg_loss_value.item(), loss.item()))
+
+                    # final_time = time.time()
+                    # print("BP time:", math.fabs(final_time - running_time))
+
+                    torch.save(model.state_dict(), model_saved_path)
     print("The training ends!")
 
 def test(args, dataset, device):

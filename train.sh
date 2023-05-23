@@ -1,0 +1,1 @@
+python Our_TopK%_RankingList.py --model "CAGED" --mode "train" --dataset "FB15K-237"
