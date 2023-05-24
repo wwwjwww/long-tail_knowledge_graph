@@ -203,78 +203,191 @@ def test(args, dataset, device):
     args.total_ent = dataset.num_entity
     args.total_rel = dataset.num_relation
 
-    entityId2vec, relationId2vec = transE_loader(data_path)
     all_triples = dataset.triples_with_anomalies
     anomaly_label = dataset.triples_with_anomalies_labels
     long_tail_label = dataset.triples_with_long_tail_labels
 
     dlist = []
     dlist_long_tail = []
+    if model_name == "CAGED":
+        num_iterations = math.ceil(dataset.num_triples_with_anomalies / args.batch_size)
+        total_num_anomalies = dataset.num_anomalies
 
-    for idx in range(len(all_triples)):
-        h = all_triples[idx][0]
-        r = all_triples[idx][1]
-        t = all_triples[idx][2]
-        dlist.append((idx, distanceL1(np.array(entityId2vec[h]), np.array(relationId2vec[r]), np.array(entityId2vec[t]))))
-        dlist = sorted(dlist, key=lambda val: val[1], reverse=True)
-    with open("rank_triple", 'w') as f:
-        f.write(str(dlist))
-        f.close()
+        model_saved_path = model_name + "_" + args.dataset + "_" + str(args.anomaly_ratio) + ".ckpt"
+        model_saved_path = os.path.join(args.save_dir, model_saved_path)
 
-    for idx in range(len(all_triples)):
-        if long_tail_label[idx] == 1:
+        model1 = BiLSTM_Attention(args, args.BiLSTM_input_size, args.BiLSTM_hidden_size, args.BiLSTM_num_layers,
+                                  args.dropout,
+                                  args.alpha, args.mu, device).to(device)
+        model1.load_state_dict(torch.load(model_saved_path))
+        model1.eval()
+        with torch.no_grad():
+            all_loss = []
+            all_label = []
+            all_pred = []
+            start_id = 0
+            # epochs = int(len(dataset.bp_triples_label) / 100)
+            # 2720
+            for i in range(num_iterations):
+                # start_read_time = time.time()
+                batch_h, batch_r, batch_t, labels, start_id, batch_size = get_pair_batch_test(dataset, args.batch_size,
+                                                                                              args.num_neighbor,
+                                                                                              start_id)
+                # labels = labels.unsqueeze(1)
+                # batch_size = input_triples.size(0)
+
+                batch_h = torch.LongTensor(batch_h).to(device)
+                batch_t = torch.LongTensor(batch_t).to(device)
+                batch_r = torch.LongTensor(batch_r).to(device)
+                labels = labels.to(device)
+                out, out_att = model1(batch_h, batch_r, batch_t)
+                out_att = out_att.reshape(batch_size, 2, 2 * 3 * args.BiLSTM_hidden_size)
+                out_att_view0 = out_att[:, 0, :]
+                out_att_view1 = out_att[:, 1, :]
+                # [B, 600] [B, 600]
+
+                loss = args.lam * torch.norm(out_att_view0 - out_att_view1, p=2, dim=1) + \
+                       torch.norm(out[:, 0:2 * args.BiLSTM_hidden_size] +
+                                  out[:, 2 * args.BiLSTM_hidden_size:2 * 2 * args.BiLSTM_hidden_size] -
+                                  out[:, 2 * 2 * args.BiLSTM_hidden_size:2 * 3 * args.BiLSTM_hidden_size], p=2, dim=1)
+
+                all_loss += loss
+                all_label += labels
+
+                # print('{}th test data'.format(i))
+                logging.info('[Test] Evaluation on %d batch of Original graph' % i)
+                # sum = labels.sum()
+                # if sum < labels.size(0):
+                #     # loss = -1 * loss
+                #     AUC = roc_auc_score(labels.cpu(), loss.cpu())
+                #     print('AUC on the {}th test images: {} %'.format(i, np.around(AUC)))
+
+            total_num = len(all_label)
+
+            max_top_k = total_num_anomalies * 2
+            min_top_k = total_num_anomalies // 10
+            # all_loss = torch.from_numpy(np.array(list(all_loss.to(torch.device("cpu"))).astype(np.float))
+
+            all_loss = np.array(all_loss)
+            all_loss = torch.from_numpy(all_loss)
+
+            top_loss, top_indices = torch.topk(all_loss, max_top_k, largest=True, sorted=True)
+            top_labels = toarray([all_label[top_indices[iii]] for iii in range(len(top_indices))])
+
+            anomaly_discovered = []
+            for i in range(max_top_k):
+                if i == 0:
+                    anomaly_discovered.append(top_labels[i])
+                else:
+                    anomaly_discovered.append(anomaly_discovered[i - 1] + top_labels[i])
+
+            results_interval_10 = np.array([anomaly_discovered[i * 10] for i in range(max_top_k // 10)])
+            # print(results_interval_10)
+            logging.info('[Train] final results: %s' % str(results_interval_10))
+
+            top_k = np.arange(1, max_top_k + 1)
+
+            assert len(top_k) == len(anomaly_discovered), 'The size of result list is wrong'
+
+            precision_k = np.array(anomaly_discovered) / top_k
+            recall_k = np.array(anomaly_discovered) * 1.0 / total_num_anomalies
+
+            precision_interval_10 = [precision_k[i * 10] for i in range(max_top_k // 10)]
+            # print(precision_interval_10)
+            logging.info('[Test] final Precision: %s' % str(precision_interval_10))
+            recall_interval_10 = [recall_k[i * 10] for i in range(max_top_k // 10)]
+            # print(recall_interval_10)
+            logging.info('[Test] final Recall: %s' % str(recall_interval_10))
+
+            logging.info('K = %d' % args.max_epoch)
+            ratios = [0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14,
+                      0.15, 0.20, 0.30, 0.45]
+            for i in range(len(ratios)):
+                num_k = int(ratios[i] * dataset.num_original_triples)
+
+                if num_k > len(anomaly_discovered):
+                    break
+
+                recall = anomaly_discovered[num_k - 1] * 1.0 / total_num_anomalies
+                precision = anomaly_discovered[num_k - 1] * 1.0 / num_k
+
+                logging.info(
+                    '[Test][%s][%s] Precision %f -- %f : %f' % (
+                    args.dataset, model_name, args.anomaly_ratio, ratios[i], precision))
+                logging.info('[Test][%s][%s] Recall  %f-- %f : %f' % (
+                args.dataset, model_name, args.anomaly_ratio, ratios[i], recall))
+                logging.info('[Test][%s][%s] anomalies in total: %d -- discovered:%d -- K : %d' % (
+                    args.dataset, model_name, total_num_anomalies, anomaly_discovered[num_k - 1], num_k))
+
+    else:
+        entityId2vec, relationId2vec = transE_loader(data_path)
+        for idx in range(len(all_triples)):
             h = all_triples[idx][0]
             r = all_triples[idx][1]
             t = all_triples[idx][2]
-            dlist_long_tail.append((idx, distanceL1(np.array(entityId2vec[h]), np.array(relationId2vec[r]), np.array(entityId2vec[t]))))
-            dlist_long_tail = sorted(dlist_long_tail, key=lambda val: val[1], reverse=True)
-    with open("rank_triple_long_tail", 'w') as f:
-        f.write(str(dlist_long_tail))
-        f.close()
-    '''
-    with open("rank_triple") as f:
-        dlist = f.read()
-        dlist = eval(dlist)
-    
-    with open("rank_triple_long_tail") as f1:
-        dlist_long_tail = f1.read()
-        dlist_long_tail = eval(dlist_long_tail)     
-    '''
+            dlist.append(
+                (idx, distanceL1(np.array(entityId2vec[h]), np.array(relationId2vec[r]), np.array(entityId2vec[t]))))
+            dlist = sorted(dlist, key=lambda val: val[1], reverse=True)
+        with open("rank_triple", 'w') as f:
+            f.write(str(dlist))
+            f.close()
 
+        for idx in range(len(all_triples)):
+            if long_tail_label[idx] == 1:
+                h = all_triples[idx][0]
+                r = all_triples[idx][1]
+                t = all_triples[idx][2]
+                dlist_long_tail.append((idx, distanceL1(np.array(entityId2vec[h]), np.array(relationId2vec[r]),
+                                                        np.array(entityId2vec[t]))))
+                dlist_long_tail = sorted(dlist_long_tail, key=lambda val: val[1], reverse=True)
+        with open("rank_triple_long_tail", 'w') as f:
+            f.write(str(dlist_long_tail))
+            f.close()
+        '''
+        with open("rank_triple") as f:
+            dlist = f.read()
+            dlist = eval(dlist)
 
-    ratios = [0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15,
-              0.20, 0.30, 0.45]
-    for i in range(len(ratios)):
-        num_k = int(ratios[i] * dataset.num_original_triples)
-        num_k_long_tail = int(ratios[i] * dataset.num_long_tail_triple)
-        anomaly_detected = 0
-        anomaly_detected_long_tail = 0
-        
-        for j in range(num_k):
-            if anomaly_label[int(dlist[j][0])] == 1:
-                anomaly_detected += 1
-        precision_k = anomaly_detected * 1.0 / num_k
-        recall = anomaly_detected * 1.0 / total_num_anomalies
-        logging.info(
-            '[Test][%s][%s] Precision %f -- %f : %f' % (
-            args.dataset, model_name, args.anomaly_ratio, ratios[i], precision_k))
-        logging.info(
-            '[Test][%s][%s] Recall  %f-- %f : %f' % (args.dataset, model_name, args.anomaly_ratio, ratios[i], recall))
-        logging.info('[Test][%s][%s] anomalies in total: %d -- discovered:%d -- K : %d' % (
-            args.dataset, model_name, total_num_anomalies, anomaly_detected, num_k))
+        with open("rank_triple_long_tail") as f1:
+            dlist_long_tail = f1.read()
+            dlist_long_tail = eval(dlist_long_tail)     
+        '''
 
-        for m in range(num_k_long_tail):
-            if anomaly_label[int(dlist_long_tail[m][0])] == 1:
-                anomaly_detected_long_tail += 1
-        precision_k_long_tail = anomaly_detected_long_tail * 1.0 / num_k_long_tail
-        recall_long_tail = anomaly_detected_long_tail * 1.0 / total_num_long_tail_anomalies
-        logging.info(
-            '[Test][%s][%s] Long-tail triple Precision %f -- %f : %f' % (
-                args.dataset, model_name, args.anomaly_ratio, ratios[i], precision_k_long_tail))
-        logging.info(
-            '[Test][%s][%s] Long-tail triple Recall  %f-- %f : %f' % (args.dataset, model_name, args.anomaly_ratio, ratios[i], recall_long_tail))
-        logging.info('[Test][%s][%s] Long-tail triple anomalies in total: %d -- discovered:%d -- K : %d' % (
-            args.dataset, model_name, total_num_anomalies, anomaly_detected_long_tail, num_k_long_tail))
+        ratios = [0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15,
+                  0.20, 0.30, 0.45]
+        for i in range(len(ratios)):
+            num_k = int(ratios[i] * dataset.num_original_triples)
+            num_k_long_tail = int(ratios[i] * dataset.num_long_tail_triple)
+            anomaly_detected = 0
+            anomaly_detected_long_tail = 0
+
+            for j in range(num_k):
+                if anomaly_label[int(dlist[j][0])] == 1:
+                    anomaly_detected += 1
+            precision_k = anomaly_detected * 1.0 / num_k
+            recall = anomaly_detected * 1.0 / total_num_anomalies
+            logging.info(
+                '[Test][%s][%s] Precision %f -- %f : %f' % (
+                    args.dataset, model_name, args.anomaly_ratio, ratios[i], precision_k))
+            logging.info(
+                '[Test][%s][%s] Recall  %f-- %f : %f' % (
+                args.dataset, model_name, args.anomaly_ratio, ratios[i], recall))
+            logging.info('[Test][%s][%s] anomalies in total: %d -- discovered:%d -- K : %d' % (
+                args.dataset, model_name, total_num_anomalies, anomaly_detected, num_k))
+
+            for m in range(num_k_long_tail):
+                if anomaly_label[int(dlist_long_tail[m][0])] == 1:
+                    anomaly_detected_long_tail += 1
+            precision_k_long_tail = anomaly_detected_long_tail * 1.0 / num_k_long_tail
+            recall_long_tail = anomaly_detected_long_tail * 1.0 / total_num_long_tail_anomalies
+            logging.info(
+                '[Test][%s][%s] Long-tail triple Precision %f -- %f : %f' % (
+                    args.dataset, model_name, args.anomaly_ratio, ratios[i], precision_k_long_tail))
+            logging.info(
+                '[Test][%s][%s] Long-tail triple Recall  %f-- %f : %f' % (
+                args.dataset, model_name, args.anomaly_ratio, ratios[i], recall_long_tail))
+            logging.info('[Test][%s][%s] Long-tail triple anomalies in total: %d -- discovered:%d -- K : %d' % (
+                args.dataset, model_name, total_num_anomalies, anomaly_detected_long_tail, num_k_long_tail))
 
 
 if __name__ == '__main__':
