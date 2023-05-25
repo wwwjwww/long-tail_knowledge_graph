@@ -295,7 +295,6 @@ def get_pair_batch_test(dataset, batch_size, num_neighbor, start_id):
     labels = dataset.triples_with_anomalies_labels
     # all_triples_labels = torch.cat((all_triples, labels), dim=1)
     # print('all_triples_labels.shape', all_triples_labels.shape)
-    labels = labels.unsqueeze(1)
 
     length = batch_size
     if start_id + batch_size > len(all_triples):
@@ -311,12 +310,12 @@ def get_pair_batch_test(dataset, batch_size, num_neighbor, start_id):
 
     batch_triples = []
     for i in range(len(sample_triple)):
-        hrt_neighbor = get_triple_neighbor(sample_triple[i][0].item(), sample_triple[i][1].item(), sample_triple[i][2].item(), dataset, num_neighbor)
+        hrt_neighbor = get_triple_neighbor(sample_triple[i][0], sample_triple[i][1], sample_triple[i][2], dataset, num_neighbor)
         batch_triples = batch_triples + hrt_neighbor
 
     batch_h = np.array([batch_triples[i][0] for i in range(len(batch_triples))])
     batch_r = np.array([batch_triples[i][1] for i in range(len(batch_triples))])
     batch_t = np.array([batch_triples[i][2] for i in range(len(batch_triples))])
 
-    print(batch_labels)
+    #print(batch_labels)
     return batch_h, batch_r, batch_t, toarray(batch_labels), start_id, length
